@@ -97,11 +97,8 @@ def draw_risk_texts(frame: np.ndarray, risk_texts: List[str]) -> None:
 
 
 def draw_emergency_border(frame: np.ndarray, timestamp: float, period_sec: float = 0.5) -> None:
-    """긴급 단계에서 빨간 점멸 테두리를 그립니다."""
-    cycle = int(timestamp / period_sec) % 2
-    if cycle == 0:
-        return
-
+    """긴급 단계에서 고정 빨간 테두리를 그립니다."""
+    _ = timestamp, period_sec
     h, w = frame.shape[:2]
     cv2.rectangle(frame, (0, 0), (w - 1, h - 1), (0, 0, 255), 10)
 

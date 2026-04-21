@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import tempfile
 import time
+import platform
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -69,8 +70,12 @@ def init_session_state() -> None:
 		"demo_mode": False,
 		"source_message": "",
 		"synthetic_frame_index": 0,
+		"display_frame_count": 0,
+		"inference_frame_count": 0,
+		"latest_frame_bgr": None,
 		"last_frame_rgb": None,
 		"last_metrics": None,
+		"last_overlay_state": None,
 	}
 
 	for key, value in defaults.items():
@@ -215,12 +220,39 @@ def is_headless_opencv_build() -> bool:
 	return "GUI:                           NONE" in build_info or "GUI: NONE" in build_info
 
 
+def webcam_backend_candidates() -> List[Tuple[str, Any]]:
+	"""OS별 권장 웹캠 백엔드 후보를 우선순위대로 반환합니다."""
+	system = platform.system().lower()
+	candidates: List[Tuple[str, Any]] = []
+
+	if system == "windows":
+		# Windows MSMF 경고를 줄이기 위해 DSHOW를 우선 사용합니다.
+		if hasattr(cv2, "CAP_DSHOW"):
+			candidates.append(("DSHOW", cv2.CAP_DSHOW))
+	elif system == "darwin":
+		if hasattr(cv2, "CAP_AVFOUNDATION"):
+			candidates.append(("AVFOUNDATION", cv2.CAP_AVFOUNDATION))
+	elif system == "linux":
+		if hasattr(cv2, "CAP_V4L2"):
+			candidates.append(("V4L2", cv2.CAP_V4L2))
+
+	candidates.append(("AUTO", None))
+	return candidates
+
+
+def webcam_platform_hint() -> str:
+	"""웹캠 실패 시 플랫폼별 점검 힌트를 반환합니다."""
+	system = platform.system().lower()
+	if system == "windows":
+		return "Windows 카메라 권한, 장치 인덱스(0~5), 다른 앱의 카메라 점유 여부를 확인하세요."
+	if system == "darwin":
+		return "macOS 카메라 권한과 장치 인덱스를 확인하세요."
+	return "카메라 권한, 장치 인덱스, 다른 앱의 카메라 점유 여부를 확인하세요."
+
+
 def open_webcam_capture(webcam_index: int) -> Tuple[Any, str]:
 	"""웹캠 장치를 여러 백엔드로 열어보고 캡처 객체와 진단 문자열을 반환합니다."""
-	backend_candidates: List[Tuple[str, Any]] = []
-	if hasattr(cv2, "CAP_AVFOUNDATION"):
-		backend_candidates.append(("AVFOUNDATION", cv2.CAP_AVFOUNDATION))
-	backend_candidates.append(("AUTO", None))
+	backend_candidates = webcam_backend_candidates()
 
 	probe_indices = [int(webcam_index)]
 	if webcam_index != 0:
@@ -238,7 +270,23 @@ def open_webcam_capture(webcam_index: int) -> Tuple[Any, str]:
 				capture = None
 
 			if capture is not None and capture.isOpened():
-				return capture, f"index={index}, backend={backend_name}"
+				try:
+					capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+				except Exception:
+					pass
+
+				# 첫 프레임이 유효해야 실제 표시 가능 상태로 간주합니다.
+				try:
+					warm_success, warm_frame = capture.read()
+				except Exception:
+					warm_success, warm_frame = False, None
+
+				if warm_success and warm_frame is not None:
+					return capture, f"index={index}, backend={backend_name}"
+
+				capture.release()
+				tried.append(f"index={index}, backend={backend_name}, opened-no-frame")
+				continue
 
 			if capture is not None:
 				capture.release()
@@ -287,7 +335,7 @@ def ensure_capture(selected_source: str, uploaded_file: Any, webcam_index: int) 
 					return
 
 			st.session_state["source_message"] = (
-				f"웹캠 열기 실패({probe_meta}). macOS 카메라 권한과 장치 인덱스를 확인하세요.{headless_hint}"
+				f"웹캠 열기 실패({probe_meta}). {webcam_platform_hint()}{headless_hint}"
 			)
 		return
 
@@ -332,8 +380,22 @@ def read_next_frame(selected_source: str, uploaded_file: Any, webcam_index: int)
 
 		if selected_source == "웹캠 (실시간)":
 			release_capture()
+			retry_capture, retry_meta = open_webcam_capture(webcam_index)
+			if retry_capture is not None:
+				st.session_state["capture"] = retry_capture
+				st.session_state["capture_key"] = f"webcam-{webcam_index}"
+				st.session_state["demo_mode"] = False
+				st.session_state["source_message"] = f"웹캠 프레임 복구 성공 ({retry_meta})"
+				retry_success, retry_frame = retry_capture.read()
+				if retry_success and retry_frame is not None:
+					return retry_frame, st.session_state["source_message"]
+
+				retry_capture.release()
+				st.session_state["capture"] = None
+				st.session_state["capture_key"] = None
+
 			st.session_state["demo_mode"] = True
-			st.session_state["source_message"] = "웹캠 연결 해제: 합성 시뮬레이션 데모 모드"
+			st.session_state["source_message"] = "웹캠 프레임 읽기 실패: 합성 시뮬레이션 데모 모드"
 
 	# 어떤 입력도 사용할 수 없으면 합성 시뮬레이션 프레임을 생성합니다.
 	frame_index = int(st.session_state.get("synthetic_frame_index", 0))
@@ -466,6 +528,14 @@ def process_frame(
 		timestamp=time.time(),
 	)
 	overlay_rgb = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB)
+	st.session_state["last_overlay_state"] = {
+		"tracked_objects": tracked_objects,
+		"child_ids": child_ids,
+		"roi": roi,
+		"entrance_roi": entrance_roi,
+		"risk_texts": list(risk_texts),
+		"response_level": int(response.get("level", 0)),
+	}
 
 	metrics = {
 		"person_count": len(persons),
@@ -560,6 +630,168 @@ def render_event_views() -> None:
 	st.plotly_chart(fig, width="stretch")
 
 
+def render_frame_image(slot: Any, frame_rgb: np.ndarray) -> None:
+	"""Streamlit 버전/설정 차이를 고려해 프레임 이미지를 안전하게 표시합니다."""
+	try:
+		slot.image(frame_rgb, channels="RGB", width="stretch")
+	except TypeError:
+		slot.image(frame_rgb, channels="RGB", use_container_width=True)
+
+
+def default_metrics(crowd_threshold: int) -> Dict[str, Any]:
+	"""초기/유휴 상태에서 사용하는 기본 메트릭 딕셔너리를 반환합니다."""
+	return {
+		"person_count": 0,
+		"crowd_count": 0,
+		"crowd_threshold": crowd_threshold,
+		"response": {
+			"stage": "NORMAL",
+			"label": "정상",
+			"color": "#1E8E3E",
+			"action": "정상 운영 상태",
+		},
+		"risk_status": {
+			"carrier": False,
+			"fall": False,
+			"direction": False,
+			"child": False,
+			"crowding": False,
+		},
+		"active_risk_labels": [],
+	}
+
+
+def compose_overlay_frame(frame_bgr: np.ndarray, escalator_direction: str) -> np.ndarray:
+	"""원본 프레임 위에 최신 감지 오버레이만 합성한 RGB 프레임을 반환합니다."""
+	preview_bgr = cv2.resize(frame_bgr, (640, 480), interpolation=cv2.INTER_LINEAR)
+	overlay_state = st.session_state.get("last_overlay_state")
+	if isinstance(overlay_state, dict):
+		cached_roi = overlay_state.get("roi")
+		cached_entrance_roi = overlay_state.get("entrance_roi")
+		if isinstance(cached_roi, (tuple, list)) and len(cached_roi) == 4:
+			roi: Tuple[int, int, int, int] = (
+				int(cached_roi[0]),
+				int(cached_roi[1]),
+				int(cached_roi[2]),
+				int(cached_roi[3]),
+			)
+		else:
+			roi = compute_default_roi(preview_bgr.shape)
+
+		if isinstance(cached_entrance_roi, (tuple, list)) and len(cached_entrance_roi) == 4:
+			entrance_roi: Tuple[int, int, int, int] = (
+				int(cached_entrance_roi[0]),
+				int(cached_entrance_roi[1]),
+				int(cached_entrance_roi[2]),
+				int(cached_entrance_roi[3]),
+			)
+		else:
+			entrance_roi = compute_entrance_roi(roi, escalator_direction)
+
+		preview_bgr = render_overlay(
+			frame=preview_bgr,
+			tracked_objects=overlay_state.get("tracked_objects", []),
+			child_ids=overlay_state.get("child_ids", []),
+			roi=roi,
+			entrance_roi=entrance_roi,
+			risk_texts=overlay_state.get("risk_texts", []),
+			response_level=int(overlay_state.get("response_level", 0)),
+			timestamp=time.time(),
+		)
+
+	return cv2.cvtColor(preview_bgr, cv2.COLOR_BGR2RGB)
+
+
+def process_frame_with_stride(
+	selected_source: str,
+	uploaded_file: Any,
+	webcam_index: int,
+	escalator_direction: str,
+	crowd_threshold: int,
+	inference_stride: int,
+) -> Tuple[np.ndarray, Dict[str, Any], str]:
+	"""실시간 화면 체감을 높이기 위해 추론 주기를 조절해 프레임을 처리합니다."""
+	frame_bgr, source_message = read_next_frame(selected_source, uploaded_file, webcam_index)
+	stride = max(1, int(inference_stride))
+
+	display_count = int(st.session_state.get("display_frame_count", 0)) + 1
+	st.session_state["display_frame_count"] = display_count
+
+	should_infer = display_count % stride == 0 or st.session_state.get("last_metrics") is None
+	if should_infer:
+		frame_rgb, metrics = process_frame(
+			frame_bgr=frame_bgr,
+			escalator_direction=escalator_direction,
+			crowd_threshold=crowd_threshold,
+		)
+		st.session_state["inference_frame_count"] = int(st.session_state.get("inference_frame_count", 0)) + 1
+		return frame_rgb, metrics, source_message
+
+	preview_bgr = cv2.resize(frame_bgr, (640, 480), interpolation=cv2.INTER_LINEAR)
+	overlay_state = st.session_state.get("last_overlay_state")
+	if isinstance(overlay_state, dict):
+		cached_roi = overlay_state.get("roi")
+		cached_entrance_roi = overlay_state.get("entrance_roi")
+		if isinstance(cached_roi, (tuple, list)) and len(cached_roi) == 4:
+			roi: Tuple[int, int, int, int] = (
+				int(cached_roi[0]),
+				int(cached_roi[1]),
+				int(cached_roi[2]),
+				int(cached_roi[3]),
+			)
+		else:
+			roi = compute_default_roi(preview_bgr.shape)
+
+		if isinstance(cached_entrance_roi, (tuple, list)) and len(cached_entrance_roi) == 4:
+			entrance_roi: Tuple[int, int, int, int] = (
+				int(cached_entrance_roi[0]),
+				int(cached_entrance_roi[1]),
+				int(cached_entrance_roi[2]),
+				int(cached_entrance_roi[3]),
+			)
+		else:
+			entrance_roi = compute_entrance_roi(roi, escalator_direction)
+		preview_bgr = render_overlay(
+			frame=preview_bgr,
+			tracked_objects=overlay_state.get("tracked_objects", []),
+			child_ids=overlay_state.get("child_ids", []),
+			roi=roi,
+			entrance_roi=entrance_roi,
+			risk_texts=overlay_state.get("risk_texts", []),
+			response_level=int(overlay_state.get("response_level", 0)),
+			timestamp=time.time(),
+		)
+	preview_rgb = cv2.cvtColor(preview_bgr, cv2.COLOR_BGR2RGB)
+	last_metrics = st.session_state.get("last_metrics")
+	if isinstance(last_metrics, dict):
+		metrics = last_metrics
+	else:
+		metrics = {
+			"person_count": 0,
+			"crowd_count": 0,
+			"crowd_threshold": crowd_threshold,
+			"response": {
+				"stage": "NORMAL",
+				"label": "정상",
+				"color": "#1E8E3E",
+				"action": "정상 운영 상태",
+			},
+			"risk_status": {
+				"carrier": False,
+				"fall": False,
+				"direction": False,
+				"child": False,
+				"crowding": False,
+			},
+			"active_risk_labels": [],
+		}
+
+	if stride > 1:
+		source_message = f"{source_message} | 경량 모드: {stride}프레임마다 AI 추론"
+
+	return preview_rgb, metrics, source_message
+
+
 def run_dashboard() -> None:
 	"""대시보드 메인 UI와 프레임 처리 루프를 실행합니다."""
 	st.sidebar.title("E-SAFE 관제 대시보드 — 인천공항")
@@ -597,6 +829,13 @@ def run_dashboard() -> None:
 	conf_threshold = st.sidebar.slider("감지 모델 신뢰도 임계값", 0.3, 0.9, 0.5, 0.05)
 	display_fps = st.sidebar.slider("대시보드 화면 FPS", min_value=5, max_value=30, value=15)
 	frame_interval_seconds = max(1.0 / float(display_fps), 0.03)
+	inference_interval_seconds = max(frame_interval_seconds * 2.5, 0.18)
+	use_fragment_mode = st.sidebar.toggle(
+		"고속 갱신 모드(실험)",
+		value=True,
+		help="영상이 비어 보이면 끄고 안정 모드로 전환하세요.",
+	)
+	st.sidebar.caption("표시 모드: 원본 프레임 + 최신 오버레이 (추론은 별도 주기 실행)")
 
 	ensure_runtime(conf_threshold)
 
@@ -628,9 +867,44 @@ def run_dashboard() -> None:
 		frame_slot = st.empty()
 		caption_slot = st.empty()
 
-	if st.session_state.get("running", False) and hasattr(st, "fragment"):
+	if st.session_state.get("running", False) and hasattr(st, "fragment") and use_fragment_mode:
+		# fragment 초기 실행이 지연되더라도 빈 화면이 보이지 않도록 즉시 프리뷰를 표시합니다.
+		fallback_frame = st.session_state.get("last_frame_rgb")
+		if fallback_frame is None:
+			preview = generate_synthetic_frame(int(st.session_state.get("synthetic_frame_index", 0)))
+			fallback_frame = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
+
+		with main_left:
+			render_frame_image(frame_slot, fallback_frame)
+			caption_slot.caption(st.session_state.get("source_message", "웹캠 연결 중..."))
+
 		@st.fragment(run_every=frame_interval_seconds)
-		def render_live_fragment() -> None:
+		def render_live_frame_fragment() -> None:
+			frame_bgr, source_message = read_next_frame(source_choice, uploaded_file, webcam_index)
+			st.session_state["latest_frame_bgr"] = frame_bgr
+			frame_rgb = compose_overlay_frame(frame_bgr, escalator_direction)
+			st.session_state["last_frame_rgb"] = frame_rgb
+
+			with main_left:
+				render_frame_image(frame_slot, frame_rgb)
+				caption_slot.caption(source_message)
+
+		@st.fragment(run_every=inference_interval_seconds)
+		def render_inference_fragment() -> None:
+			latest_frame = st.session_state.get("latest_frame_bgr")
+			if not isinstance(latest_frame, np.ndarray):
+				return
+
+			_, metrics = process_frame(
+				frame_bgr=latest_frame,
+				escalator_direction=escalator_direction,
+				crowd_threshold=crowd_threshold,
+			)
+			st.session_state["last_metrics"] = metrics
+			st.session_state["inference_frame_count"] = int(st.session_state.get("inference_frame_count", 0)) + 1
+
+		@st.fragment(run_every=0.35)
+		def render_side_fragment() -> None:
 			live_response = {
 				"stage": "NORMAL",
 				"label": "정상",
@@ -640,55 +914,49 @@ def run_dashboard() -> None:
 			if st.session_state.get("last_metrics"):
 				live_response = st.session_state["last_metrics"].get("response", live_response)
 
-			frame_bgr, source_message = read_next_frame(source_choice, uploaded_file, webcam_index)
-			frame_rgb, metrics = process_frame(
-				frame_bgr=frame_bgr,
-				escalator_direction=escalator_direction,
-				crowd_threshold=crowd_threshold,
-			)
-			st.session_state["last_frame_rgb"] = frame_rgb
-			st.session_state["last_metrics"] = metrics
-			live_response = metrics.get("response", live_response)
 			render_banner(live_response, banner_slot)
-
-			with main_left:
-				frame_slot.image(frame_rgb, channels="RGB", width="stretch")
-				caption_slot.caption(source_message)
+			metrics = st.session_state.get("last_metrics")
+			if not isinstance(metrics, dict):
+				metrics = default_metrics(crowd_threshold)
 
 			with main_right:
 				render_status_panel(metrics)
 
-			if metrics.get("response", {}).get("emergency_popup", False):
+			if isinstance(metrics, dict) and metrics.get("response", {}).get("emergency_popup", False):
 				st.error("에스컬레이터 자동 정지 신호 발송")
 
 			if source_choice == "웹캠 (실시간)" and st.session_state.get("demo_mode", False):
 				st.warning(st.session_state.get("source_message", "웹캠 연결에 실패하여 데모 모드로 동작합니다."))
 				st.info("해결 팁: 카메라 권한 허용, 장치 인덱스 변경(0~5), opencv-python 설치 상태를 확인하세요.")
 
-		@st.fragment(run_every=1.0)
+		@st.fragment(run_every=2.0)
 		def render_event_fragment() -> None:
 			render_event_views()
 
-		render_live_fragment()
+		render_live_frame_fragment()
+		render_inference_fragment()
+		render_side_fragment()
 		render_event_fragment()
 		return
 
 	if st.session_state.get("running", False):
 		loop_start = time.perf_counter()
 		frame_bgr, source_message = read_next_frame(source_choice, uploaded_file, webcam_index)
+		st.session_state["latest_frame_bgr"] = frame_bgr
 
-		frame_rgb, metrics = process_frame(
+		_, metrics = process_frame(
 			frame_bgr=frame_bgr,
 			escalator_direction=escalator_direction,
 			crowd_threshold=crowd_threshold,
 		)
+		frame_rgb = compose_overlay_frame(frame_bgr, escalator_direction)
 		st.session_state["last_frame_rgb"] = frame_rgb
 		st.session_state["last_metrics"] = metrics
 		response_for_banner = metrics.get("response", response_for_banner)
 		render_banner(response_for_banner, banner_slot)
 
 		with main_left:
-			frame_slot.image(frame_rgb, channels="RGB", width="stretch")
+			render_frame_image(frame_slot, frame_rgb)
 			caption_slot.caption(source_message)
 
 		with main_right:
@@ -713,7 +981,7 @@ def run_dashboard() -> None:
 		if last_frame is None:
 			preview = generate_synthetic_frame(0)
 			last_frame = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
-		frame_slot.image(last_frame, channels="RGB", width="stretch")
+		render_frame_image(frame_slot, last_frame)
 		caption_slot.caption("대기 상태입니다. 시작 버튼을 누르면 실시간 감지가 시작됩니다.")
 
 	with main_right:
