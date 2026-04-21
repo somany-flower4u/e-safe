@@ -205,25 +205,73 @@ def generate_synthetic_frame(frame_index: int, width: int = 640, height: int = 4
 	return frame
 
 
-def ensure_capture(selected_source: str, uploaded_file: Any) -> None:
+def is_headless_opencv_build() -> bool:
+	"""OpenCV가 headless 빌드인지 추정합니다."""
+	try:
+		build_info = cv2.getBuildInformation()
+	except Exception:
+		return False
+
+	return "GUI:                           NONE" in build_info or "GUI: NONE" in build_info
+
+
+def open_webcam_capture(webcam_index: int) -> Tuple[Any, str]:
+	"""웹캠 장치를 여러 백엔드로 열어보고 캡처 객체와 진단 문자열을 반환합니다."""
+	backend_candidates: List[Tuple[str, Any]] = []
+	if hasattr(cv2, "CAP_AVFOUNDATION"):
+		backend_candidates.append(("AVFOUNDATION", cv2.CAP_AVFOUNDATION))
+	backend_candidates.append(("AUTO", None))
+
+	probe_indices = [int(webcam_index)]
+	if webcam_index != 0:
+		probe_indices.append(0)
+
+	tried: List[str] = []
+	for index in probe_indices:
+		for backend_name, backend in backend_candidates:
+			try:
+				if backend is None:
+					capture = cv2.VideoCapture(index)
+				else:
+					capture = cv2.VideoCapture(index, backend)
+			except Exception:
+				capture = None
+
+			if capture is not None and capture.isOpened():
+				return capture, f"index={index}, backend={backend_name}"
+
+			if capture is not None:
+				capture.release()
+
+			tried.append(f"index={index}, backend={backend_name}")
+
+	return None, ", ".join(tried) if tried else "no backend tried"
+
+
+def ensure_capture(selected_source: str, uploaded_file: Any, webcam_index: int) -> None:
 	"""현재 입력 설정에 맞는 캡처 소스를 준비합니다."""
 	source_changed = st.session_state.get("source_choice") != selected_source
-	if source_changed:
+	webcam_changed = st.session_state.get("webcam_index", 0) != int(webcam_index)
+	if source_changed or (selected_source == "웹캠 (실시간)" and webcam_changed):
 		release_capture()
 		st.session_state["capture_key"] = None
 		st.session_state["demo_mode"] = False
 		st.session_state["source_choice"] = selected_source
+		st.session_state["webcam_index"] = int(webcam_index)
 
 	if selected_source == "웹캠 (실시간)":
 		if st.session_state.get("capture") is None and not st.session_state.get("demo_mode", False):
-			webcam = cv2.VideoCapture(0)
-			if webcam.isOpened():
+			webcam, probe_meta = open_webcam_capture(webcam_index)
+			if webcam is not None:
 				st.session_state["capture"] = webcam
-				st.session_state["capture_key"] = "webcam-0"
-				st.session_state["source_message"] = "웹캠 실시간 모드"
+				st.session_state["capture_key"] = f"webcam-{webcam_index}"
+				st.session_state["source_message"] = f"웹캠 실시간 모드 ({probe_meta})"
 				return
 
-			webcam.release()
+			headless_hint = ""
+			if is_headless_opencv_build():
+				headless_hint = " OpenCV headless 빌드가 감지되었습니다(opencv-python 필요)."
+
 			st.session_state["demo_mode"] = True
 
 			# 웹캠 실패 시 업로드 영상이 있으면 자동으로 데모 입력으로 전환합니다.
@@ -233,10 +281,14 @@ def ensure_capture(selected_source: str, uploaded_file: Any) -> None:
 				if fallback.isOpened():
 					st.session_state["capture"] = fallback
 					st.session_state["capture_key"] = video_path
-					st.session_state["source_message"] = "웹캠 실패: 업로드 영상 데모 모드"
+					st.session_state["source_message"] = (
+						f"웹캠 열기 실패({probe_meta})로 업로드 영상 데모 모드로 전환되었습니다.{headless_hint}"
+					)
 					return
 
-			st.session_state["source_message"] = "웹캠 실패: 합성 시뮬레이션 데모 모드"
+			st.session_state["source_message"] = (
+				f"웹캠 열기 실패({probe_meta}). macOS 카메라 권한과 장치 인덱스를 확인하세요.{headless_hint}"
+			)
 		return
 
 	if uploaded_file is None:
@@ -259,9 +311,9 @@ def ensure_capture(selected_source: str, uploaded_file: Any) -> None:
 			st.session_state["source_message"] = "영상 파일 열기 실패: 합성 시뮬레이션 모드"
 
 
-def read_next_frame(selected_source: str, uploaded_file: Any) -> Tuple[np.ndarray, str]:
+def read_next_frame(selected_source: str, uploaded_file: Any, webcam_index: int) -> Tuple[np.ndarray, str]:
 	"""현재 소스에서 다음 프레임을 읽어 반환합니다."""
-	ensure_capture(selected_source, uploaded_file)
+	ensure_capture(selected_source, uploaded_file, webcam_index)
 	capture = st.session_state.get("capture")
 	source_message = st.session_state.get("source_message", "")
 
@@ -271,7 +323,8 @@ def read_next_frame(selected_source: str, uploaded_file: Any) -> Tuple[np.ndarra
 			return frame, source_message
 
 		# 파일 입력 또는 데모 입력은 끝에 도달하면 루프 재생합니다.
-		if st.session_state.get("capture_key") and st.session_state.get("capture_key") != "webcam-0":
+		capture_key = str(st.session_state.get("capture_key") or "")
+		if capture_key and not capture_key.startswith("webcam-"):
 			capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
 			success, frame = capture.read()
 			if success and frame is not None:
@@ -487,7 +540,7 @@ def render_event_views() -> None:
 
 	st.subheader("이벤트 로그")
 	events_df = event_logger.to_dataframe(max_rows=300)
-	st.dataframe(events_df, use_container_width=True, height=240)
+	st.dataframe(events_df, width="stretch", height=240)
 
 	st.subheader("실시간 이벤트 발생 빈도")
 	freq_df = event_logger.event_frequency_dataframe()
@@ -504,7 +557,7 @@ def render_event_views() -> None:
 		title="위험 유형별 누적 이벤트",
 	)
 	fig.update_layout(height=320, margin=dict(l=12, r=12, t=60, b=12), showlegend=False)
-	st.plotly_chart(fig, use_container_width=True)
+	st.plotly_chart(fig, width="stretch")
 
 
 def run_dashboard() -> None:
@@ -516,6 +569,16 @@ def run_dashboard() -> None:
 		["웹캠 (실시간)", "동영상 파일 업로드"],
 		index=0,
 	)
+	webcam_index = int(
+		st.sidebar.number_input(
+			"웹캠 장치 인덱스",
+			min_value=0,
+			max_value=5,
+			value=0,
+			step=1,
+		)
+	)
+	st.sidebar.caption("내장 카메라는 보통 0, 외장 카메라는 1 이상입니다.")
 	uploaded_file = st.sidebar.file_uploader(
 		"동영상 파일 업로드",
 		type=["mp4", "avi", "mov"],
@@ -532,12 +595,14 @@ def run_dashboard() -> None:
 	crowd_threshold = st.sidebar.slider("과밀 임계 인원 설정", min_value=2, max_value=10, value=5)
 	st.sidebar.caption("ROI 설정 안내: 화면 비율로 자동 설정됨")
 	conf_threshold = st.sidebar.slider("감지 모델 신뢰도 임계값", 0.3, 0.9, 0.5, 0.05)
+	display_fps = st.sidebar.slider("대시보드 화면 FPS", min_value=5, max_value=30, value=15)
+	frame_interval_seconds = max(1.0 / float(display_fps), 0.03)
 
 	ensure_runtime(conf_threshold)
 
-	start_pressed = st.sidebar.button("시작", type="primary", use_container_width=True)
-	stop_pressed = st.sidebar.button("정지", use_container_width=True)
-	save_log_pressed = st.sidebar.button("이벤트 로그 CSV 저장", use_container_width=True)
+	start_pressed = st.sidebar.button("시작", type="primary", width="stretch")
+	stop_pressed = st.sidebar.button("정지", width="stretch")
+	save_log_pressed = st.sidebar.button("이벤트 로그 CSV 저장", width="stretch")
 
 	if start_pressed:
 		st.session_state["running"] = True
@@ -563,9 +628,54 @@ def run_dashboard() -> None:
 		frame_slot = st.empty()
 		caption_slot = st.empty()
 
+	if st.session_state.get("running", False) and hasattr(st, "fragment"):
+		@st.fragment(run_every=frame_interval_seconds)
+		def render_live_fragment() -> None:
+			live_response = {
+				"stage": "NORMAL",
+				"label": "정상",
+				"color": "#1E8E3E",
+				"action": "정상 운영 상태",
+			}
+			if st.session_state.get("last_metrics"):
+				live_response = st.session_state["last_metrics"].get("response", live_response)
+
+			frame_bgr, source_message = read_next_frame(source_choice, uploaded_file, webcam_index)
+			frame_rgb, metrics = process_frame(
+				frame_bgr=frame_bgr,
+				escalator_direction=escalator_direction,
+				crowd_threshold=crowd_threshold,
+			)
+			st.session_state["last_frame_rgb"] = frame_rgb
+			st.session_state["last_metrics"] = metrics
+			live_response = metrics.get("response", live_response)
+			render_banner(live_response, banner_slot)
+
+			with main_left:
+				frame_slot.image(frame_rgb, channels="RGB", width="stretch")
+				caption_slot.caption(source_message)
+
+			with main_right:
+				render_status_panel(metrics)
+
+			if metrics.get("response", {}).get("emergency_popup", False):
+				st.error("에스컬레이터 자동 정지 신호 발송")
+
+			if source_choice == "웹캠 (실시간)" and st.session_state.get("demo_mode", False):
+				st.warning(st.session_state.get("source_message", "웹캠 연결에 실패하여 데모 모드로 동작합니다."))
+				st.info("해결 팁: 카메라 권한 허용, 장치 인덱스 변경(0~5), opencv-python 설치 상태를 확인하세요.")
+
+		@st.fragment(run_every=1.0)
+		def render_event_fragment() -> None:
+			render_event_views()
+
+		render_live_fragment()
+		render_event_fragment()
+		return
+
 	if st.session_state.get("running", False):
 		loop_start = time.perf_counter()
-		frame_bgr, source_message = read_next_frame(source_choice, uploaded_file)
+		frame_bgr, source_message = read_next_frame(source_choice, uploaded_file, webcam_index)
 
 		frame_rgb, metrics = process_frame(
 			frame_bgr=frame_bgr,
@@ -578,24 +688,22 @@ def run_dashboard() -> None:
 		render_banner(response_for_banner, banner_slot)
 
 		with main_left:
-			frame_slot.image(frame_rgb, channels="RGB", use_container_width=True)
+			frame_slot.image(frame_rgb, channels="RGB", width="stretch")
 			caption_slot.caption(source_message)
 
 		with main_right:
 			render_status_panel(metrics)
 
-		# 긴급 단계에서는 즉시 팝업 메시지를 출력합니다.
 		if metrics.get("response", {}).get("emergency_popup", False):
 			st.error("에스컬레이터 자동 정지 신호 발송")
 
-		# 목표 30FPS를 위해 프레임 간 대기 시간을 조절합니다.
 		elapsed = time.perf_counter() - loop_start
-		sleep_time = max(0.0, (1.0 / 30.0) - elapsed)
+		sleep_time = max(0.0, frame_interval_seconds - elapsed)
 		if sleep_time > 0:
 			time.sleep(sleep_time)
 
 		render_event_views()
-		st.rerun()
+		st.rerun(scope="app")
 		return
 
 	render_banner(response_for_banner, banner_slot)
@@ -605,7 +713,7 @@ def run_dashboard() -> None:
 		if last_frame is None:
 			preview = generate_synthetic_frame(0)
 			last_frame = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
-		frame_slot.image(last_frame, channels="RGB", use_container_width=True)
+		frame_slot.image(last_frame, channels="RGB", width="stretch")
 		caption_slot.caption("대기 상태입니다. 시작 버튼을 누르면 실시간 감지가 시작됩니다.")
 
 	with main_right:
@@ -616,7 +724,8 @@ def run_dashboard() -> None:
 			st.info("시작 전 상태입니다.")
 
 	if source_choice == "웹캠 (실시간)" and st.session_state.get("demo_mode", False):
-		st.warning("웹캠 연결에 실패하여 데모 모드로 동작합니다. 동영상 업로드 또는 합성 프레임이 사용됩니다.")
+		st.warning(st.session_state.get("source_message", "웹캠 연결에 실패하여 데모 모드로 동작합니다."))
+		st.info("해결 팁: 카메라 권한 허용, 장치 인덱스 변경(0~5), opencv-python 설치 상태를 확인하세요.")
 
 	render_event_views()
 
