@@ -1,5 +1,7 @@
 # esafe/detectors/__init__.py
-"""E-SAFE 위험 유형 감지기 패키지 초기화 모듈입니다."""
+"""
+E-SAFE 위험 감지 모듈 패키지
+"""
 
 from .carrier_detector import CarrierHazardDetector
 from .fall_detector import FallDetector

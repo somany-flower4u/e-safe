@@ -1,0 +1,23 @@
+# esafe/requirements.txt
+# E-SAFE: Escalator Safety AI For Everyone
+# Dependencies for real-time escalator safety monitoring system
+
+# Core Framework
+streamlit>=1.35.0
+
+# Computer Vision & AI
+opencv-python-headless>=4.9.0
+ultralytics>=8.2.0
+mediapipe>=0.10.14
+supervision>=0.21.0
+
+# Audio
+pygame>=2.6.0
+
+# Numerics & Data Processing
+numpy>=1.26.0
+scipy>=1.13.0
+pandas>=2.2.0
+
+# Visualization
+plotly>=5.22.0
