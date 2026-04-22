@@ -8,7 +8,7 @@ streamlit>=1.35.0
 # Computer Vision & AI
 opencv-python-headless>=4.9.0
 ultralytics>=8.2.0
-mediapipe>=0.10.14
+mediapipe>=0.10.21
 supervision>=0.21.0
 
 # Audio

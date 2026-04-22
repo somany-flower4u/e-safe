@@ -523,7 +523,7 @@ def update_ui(annotated_frame, current_level, event_info):
     
     # 비디오 프레임 업데이트
     frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-    video_frame_placeholder.image(frame_rgb, use_column_width=True)
+    video_frame_placeholder.image(frame_rgb, width="content")
     
     # 우측 패널 업데이트
     person_count = event_info['crowd'][0]
@@ -566,16 +566,18 @@ def update_ui(annotated_frame, current_level, event_info):
             }
             for e in events
         ])
-        log_table.dataframe(df_log, use_container_width=True, hide_index=True)
+        log_table.dataframe(df_log, width="content", hide_index=True)
     
     # 통계 차트
     event_counts = st.session_state.event_logger.get_event_count_by_type()
+    counter = 0
     if event_counts:
         df_stat = pd.DataFrame(list(event_counts.items()), columns=['위험유형', '발생횟수'])
         fig = px.bar(df_stat, x='위험유형', y='발생횟수', color='발생횟수',
                     color_continuous_scale='Reds')
         fig.update_layout(height=250, margin=dict(l=0, r=0, t=0, b=0))
-        stat_chart.plotly_chart(fig, use_container_width=True)
+        #stat_chart.plotly_chart(fig, width="content", key=f"stat_chart_{counter}")
+        counter+=1
     
     # 사운드 알림
     if current_level == '주의':
@@ -704,4 +706,4 @@ else:
     
     frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
     with col_video:
-        st.image(frame_rgb, use_column_width=True)
+        st.image(frame_rgb, width="content")
