@@ -97,6 +97,17 @@ def release_capture() -> None:
 def ensure_runtime(conf_threshold: float) -> None:
 	"""검출/추적/응답 객체를 세션에 초기화합니다."""
 	if not st.session_state.get("runtime_initialized", False):
+		# 디바이스 정보 확인 및 출력
+		try:
+			import torch
+			cuda_available = torch.cuda.is_available()
+			device_info = f"CUDA Available: {cuda_available}"
+			if cuda_available:
+				device_info += f" | GPU: {torch.cuda.get_device_name(0)}"
+			print(f"[Device Info] {device_info}")
+		except ImportError:
+			print("[Device Info] PyTorch not available for CUDA check")
+		
 		st.session_state["yolo_handler"] = YoloHandler(model_name="yolov8n.pt", conf_threshold=conf_threshold)
 		st.session_state["pose_handler"] = PoseHandler(
 			min_detection_confidence=0.5,
@@ -125,6 +136,7 @@ def ensure_runtime(conf_threshold: float) -> None:
 		st.session_state["response_system"] = AutoResponseSystem(cooldown_seconds=10.0)
 		st.session_state["event_logger"] = EventLogger(output_csv_path="events_log.csv")
 		st.session_state["runtime_initialized"] = True
+		print("[Runtime] 모든 감지 엔진 초기화 완료")
 
 	st.session_state["yolo_handler"].set_conf_threshold(conf_threshold)
 
@@ -586,7 +598,6 @@ def render_banner(response: Dict[str, Any], container: Any | None = None) -> Non
 def render_status_panel(metrics: Dict[str, Any]) -> None:
 	"""우측 실시간 감지 현황 패널을 렌더링합니다."""
 	st.subheader("실시간 감지 현황")
-
 	st.metric("감지 인원 수", metrics.get("person_count", 0))
 
 	risk_status: Dict[str, bool] = metrics.get("risk_status", {})
@@ -635,7 +646,7 @@ def render_frame_image(slot: Any, frame_rgb: np.ndarray) -> None:
 	try:
 		slot.image(frame_rgb, channels="RGB", width="stretch")
 	except TypeError:
-		slot.image(frame_rgb, channels="RGB", use_container_width=True)
+		slot.image(frame_rgb, channels="RGB", width="stretch")
 
 
 def default_metrics(crowd_threshold: int) -> Dict[str, Any]:
@@ -830,12 +841,7 @@ def run_dashboard() -> None:
 	display_fps = st.sidebar.slider("대시보드 화면 FPS", min_value=5, max_value=30, value=15)
 	frame_interval_seconds = max(1.0 / float(display_fps), 0.03)
 	inference_interval_seconds = max(frame_interval_seconds * 2.5, 0.18)
-	use_fragment_mode = st.sidebar.toggle(
-		"고속 갱신 모드(실험)",
-		value=True,
-		help="영상이 비어 보이면 끄고 안정 모드로 전환하세요.",
-	)
-	st.sidebar.caption("표시 모드: 원본 프레임 + 최신 오버레이 (추론은 별도 주기 실행)")
+	st.sidebar.caption("표시 모드: 원본 프레임 + 최신 오버레이 (렌더링만 실시간, 추론은 자동화)")
 
 	ensure_runtime(conf_threshold)
 
@@ -863,81 +869,6 @@ def run_dashboard() -> None:
 	banner_slot = st.empty()
 
 	main_left, main_right = st.columns([2, 1], gap="large")
-	with main_left:
-		frame_slot = st.empty()
-		caption_slot = st.empty()
-
-	if st.session_state.get("running", False) and hasattr(st, "fragment") and use_fragment_mode:
-		# fragment 초기 실행이 지연되더라도 빈 화면이 보이지 않도록 즉시 프리뷰를 표시합니다.
-		fallback_frame = st.session_state.get("last_frame_rgb")
-		if fallback_frame is None:
-			preview = generate_synthetic_frame(int(st.session_state.get("synthetic_frame_index", 0)))
-			fallback_frame = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
-
-		with main_left:
-			render_frame_image(frame_slot, fallback_frame)
-			caption_slot.caption(st.session_state.get("source_message", "웹캠 연결 중..."))
-
-		@st.fragment(run_every=frame_interval_seconds)
-		def render_live_frame_fragment() -> None:
-			frame_bgr, source_message = read_next_frame(source_choice, uploaded_file, webcam_index)
-			st.session_state["latest_frame_bgr"] = frame_bgr
-			frame_rgb = compose_overlay_frame(frame_bgr, escalator_direction)
-			st.session_state["last_frame_rgb"] = frame_rgb
-
-			with main_left:
-				render_frame_image(frame_slot, frame_rgb)
-				caption_slot.caption(source_message)
-
-		@st.fragment(run_every=inference_interval_seconds)
-		def render_inference_fragment() -> None:
-			latest_frame = st.session_state.get("latest_frame_bgr")
-			if not isinstance(latest_frame, np.ndarray):
-				return
-
-			_, metrics = process_frame(
-				frame_bgr=latest_frame,
-				escalator_direction=escalator_direction,
-				crowd_threshold=crowd_threshold,
-			)
-			st.session_state["last_metrics"] = metrics
-			st.session_state["inference_frame_count"] = int(st.session_state.get("inference_frame_count", 0)) + 1
-
-		@st.fragment(run_every=0.35)
-		def render_side_fragment() -> None:
-			live_response = {
-				"stage": "NORMAL",
-				"label": "정상",
-				"color": "#1E8E3E",
-				"action": "정상 운영 상태",
-			}
-			if st.session_state.get("last_metrics"):
-				live_response = st.session_state["last_metrics"].get("response", live_response)
-
-			render_banner(live_response, banner_slot)
-			metrics = st.session_state.get("last_metrics")
-			if not isinstance(metrics, dict):
-				metrics = default_metrics(crowd_threshold)
-
-			with main_right:
-				render_status_panel(metrics)
-
-			if isinstance(metrics, dict) and metrics.get("response", {}).get("emergency_popup", False):
-				st.error("에스컬레이터 자동 정지 신호 발송")
-
-			if source_choice == "웹캠 (실시간)" and st.session_state.get("demo_mode", False):
-				st.warning(st.session_state.get("source_message", "웹캠 연결에 실패하여 데모 모드로 동작합니다."))
-				st.info("해결 팁: 카메라 권한 허용, 장치 인덱스 변경(0~5), opencv-python 설치 상태를 확인하세요.")
-
-		@st.fragment(run_every=2.0)
-		def render_event_fragment() -> None:
-			render_event_views()
-
-		render_live_frame_fragment()
-		render_inference_fragment()
-		render_side_fragment()
-		render_event_fragment()
-		return
 
 	if st.session_state.get("running", False):
 		loop_start = time.perf_counter()
@@ -953,11 +884,12 @@ def run_dashboard() -> None:
 		st.session_state["last_frame_rgb"] = frame_rgb
 		st.session_state["last_metrics"] = metrics
 		response_for_banner = metrics.get("response", response_for_banner)
+		
 		render_banner(response_for_banner, banner_slot)
 
 		with main_left:
-			render_frame_image(frame_slot, frame_rgb)
-			caption_slot.caption(source_message)
+			st.image(frame_rgb, channels="RGB", width="stretch")
+			st.caption(source_message)
 
 		with main_right:
 			render_status_panel(metrics)
@@ -981,15 +913,14 @@ def run_dashboard() -> None:
 		if last_frame is None:
 			preview = generate_synthetic_frame(0)
 			last_frame = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
-		render_frame_image(frame_slot, last_frame)
-		caption_slot.caption("대기 상태입니다. 시작 버튼을 누르면 실시간 감지가 시작됩니다.")
+		st.image(last_frame, channels="RGB", width="stretch")
+		st.caption("대기 상태입니다. 시작 버튼을 누르면 실시간 감지가 시작됩니다.")
 
 	with main_right:
-		if st.session_state.get("last_metrics"):
-			render_status_panel(st.session_state["last_metrics"])
-		else:
-			st.subheader("실시간 감지 현황")
-			st.info("시작 전 상태입니다.")
+		idle_metrics = st.session_state.get("last_metrics")
+		if not isinstance(idle_metrics, dict):
+			idle_metrics = default_metrics(crowd_threshold)
+		render_status_panel(idle_metrics)
 
 	if source_choice == "웹캠 (실시간)" and st.session_state.get("demo_mode", False):
 		st.warning(st.session_state.get("source_message", "웹캠 연결에 실패하여 데모 모드로 동작합니다."))

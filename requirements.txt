@@ -1,4 +1,9 @@
 # esafe/requirements.txt
+# GPU 가속 (NVIDIA RTX 3060 CUDA 12.1 지원)
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
 ultralytics>=8.0.0
 mediapipe>=0.10.0
 supervision>=0.18.0

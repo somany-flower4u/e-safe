@@ -35,6 +35,12 @@ class YoloHandler:
 
         try:
             self.model = YOLO(self.model_name)
+            # 모델을 GPU로 전송 시도 (CUDA 없으면 CPU 자동 사용)
+            try:
+                self.model.to('cuda')
+            except Exception:
+                # CUDA 불가능하면 CPU 사용
+                pass
         except Exception:
             self.model = None
 
@@ -56,12 +62,13 @@ class YoloHandler:
             return []
 
         try:
-            # CPU 환경에서도 안정적으로 동작하도록 기본 device를 auto로 둡니다.
+            # GPU 우선 사용, 없으면 CPU로 자동 전환
             results = self.model.predict(
                 source=frame,
                 imgsz=640,
                 conf=self.conf_threshold,
                 iou=self.iou_threshold,
+                device=0,  # GPU 0번 장치 사용 (없으면 자동으로 CPU 사용)
                 verbose=False,
             )
         except Exception:
