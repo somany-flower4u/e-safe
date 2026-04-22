@@ -20,6 +20,18 @@ def _bbox_height(bbox: Tuple[float, float, float, float]) -> float:
     return float(max(0.0, bbox[3] - bbox[1]))
 
 
+def _bbox_width(bbox: Tuple[float, float, float, float]) -> float:
+    """바운딩 박스 폭을 계산합니다."""
+    return float(max(0.0, bbox[2] - bbox[0]))
+
+
+def _bbox_aspect_ratio(bbox: Tuple[float, float, float, float]) -> float:
+    """바운딩 박스 종횡비(높이/폭)를 계산합니다."""
+    height = _bbox_height(bbox)
+    width = _bbox_width(bbox)
+    return height / max(0.01, width)
+
+
 def _point_in_roi(point: Tuple[float, float], roi: Tuple[int, int, int, int]) -> bool:
     """점이 ROI 내부인지 확인합니다."""
     px, py = point
@@ -58,11 +70,13 @@ class ChildRiskDetector:
 
     def __init__(
         self,
-        child_height_ratio: float = 0.5,
+        child_height_ratio: float = 0.65,
         required_consecutive_frames: int = 3,
+        min_adult_ratio: float = 0.65,
     ) -> None:
         """감지기 파라미터를 초기화합니다."""
         self.child_height_ratio = child_height_ratio
+        self.min_adult_ratio = min_adult_ratio
         self.required_consecutive_frames = max(1, required_consecutive_frames)
 
         self.frame_count = 0
@@ -123,19 +137,20 @@ class ChildRiskDetector:
             return False, 0.0, {"hazard_type": None, "label": "정상", "child_ids": [], "location": None}
 
         max_height = max(heights)
-        adult_candidates = [h for h in heights if h >= max_height * 0.6]
+        # 성인 기준: 최대 높이의 65% 이상인 사람들의 평균값 사용
+        adult_candidates = [h for h in heights if h >= max_height * self.min_adult_ratio]
         adult_mean_height = float(np.mean(adult_candidates)) if adult_candidates else max_height
 
-        child_people: List[Dict[str, Any]] = [
-            person
-            for person in persons_in_roi
-            if person["height"] <= adult_mean_height * self.child_height_ratio
-        ]
-        adult_people: List[Dict[str, Any]] = [
-            person
-            for person in persons_in_roi
-            if person["height"] > adult_mean_height * self.child_height_ratio
-        ]
+        child_people: List[Dict[str, Any]] = []
+        adult_people: List[Dict[str, Any]] = []
+        
+        for person in persons_in_roi:
+            person_height = person["height"]
+            # 영유아 판정: 성인 평균 높이의 65% 이하이고, 절대 높이도 검증
+            if person_height <= adult_mean_height * self.child_height_ratio:
+                child_people.append(person)
+            else:
+                adult_people.append(person)
 
         if not child_people:
             self._update_counter("alone", False)
@@ -154,12 +169,15 @@ class ChildRiskDetector:
         for child in child_people:
             child_center = child["center"]
             child_bbox = child["bbox"]
+            child_height_ratio = child["height"] / max(0.01, adult_mean_height)
 
             if not adult_people:
+                # 성인이 없는 경우: 높이 비율이 낮을수록 신뢰도 증가
                 alone_candidate = True
-                alone_confidence = max(alone_confidence, 0.7)
+                alone_confidence = max(alone_confidence, min(0.95, 0.75 + (1.0 - child_height_ratio) * 0.2))
                 location = (int(child_center[0]), int(child_center[1]))
             else:
+                # 성인이 있는 경우: 거리 기반 판정
                 nearest_dist = min(
                     math.dist(child_center, adult["center"])
                     for adult in adult_people
@@ -167,9 +185,12 @@ class ChildRiskDetector:
                 )
                 if nearest_dist > radius_px:
                     alone_candidate = True
+                    # 거리가 멀수록 신뢰도 증가, 높이 비율도 반영
+                    distance_factor = min(1.0, (nearest_dist - radius_px) / max(1.0, radius_px * 2.5))
+                    height_factor = max(0.0, 1.0 - child_height_ratio) * 0.15
                     alone_confidence = max(
                         alone_confidence,
-                        min(1.0, 0.55 + (nearest_dist - radius_px) / max(1.0, radius_px * 2.0)),
+                        min(0.95, 0.65 + distance_factor * 0.25 + height_factor),
                     )
                     location = (int(child_center[0]), int(child_center[1]))
 
@@ -178,7 +199,7 @@ class ChildRiskDetector:
                 overlap = _bbox_iou(child_bbox, suitcase_bbox)
                 if _point_in_bbox(child_center, suitcase_bbox) or overlap >= 0.1:
                     carrier_candidate = True
-                    carrier_confidence = max(carrier_confidence, min(1.0, 0.6 + overlap))
+                    carrier_confidence = max(carrier_confidence, min(0.95, 0.65 + overlap * 0.3))
                     location = (int(child_center[0]), int(child_center[1]))
                     break
 
@@ -186,7 +207,7 @@ class ChildRiskDetector:
         alone_confirmed = self._update_counter("alone", alone_candidate)
 
         if carrier_confirmed:
-            return True, max(0.65, carrier_confidence), {
+            return True, max(0.70, carrier_confidence), {
                 "hazard_type": "child_on_carrier",
                 "label": "영유아 캐리어 탑승",
                 "child_ids": child_ids,
@@ -194,7 +215,7 @@ class ChildRiskDetector:
             }
 
         if alone_confirmed:
-            return True, max(0.6, alone_confidence), {
+            return True, max(0.65, alone_confidence), {
                 "hazard_type": "child_alone",
                 "label": "영유아 단독 탑승",
                 "child_ids": child_ids,
