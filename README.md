@@ -91,7 +91,7 @@ streamlit run app.py
 - "이벤트 로그 CSV 저장" 버튼은 실행 폴더에 `events_log.csv`를 만듭니다.
 
 참고할 점이 있습니다.
-- 경고음은 `pygame`이 있을 때만 재생됩니다. `requirements.txt`에는 `pygame`이 없으므로 소리를 들으려면 `pip install pygame`을 따로 실행하세요. 없으면 소리 없이 동작합니다.
+- 경고음은 `pygame`으로 재생합니다. `pygame`을 설치하지 못한 환경에서는 소리 없이 동작합니다.
 - 이 저장소에는 테스트 영상이 없습니다. 저작권 문제가 없는 영상(예: Pixabay의 에스컬레이터·공항 영상)을 직접 받아 쓰세요.
 
 ## 한계
